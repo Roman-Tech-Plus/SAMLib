@@ -1,4 +1,4 @@
-package com.vendor.jni;
+package com.gtsam.jni;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
