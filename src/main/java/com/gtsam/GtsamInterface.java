@@ -27,6 +27,7 @@ import edu.wpi.first.math.numbers.N1;
 import edu.wpi.first.math.numbers.N3;
 import edu.wpi.first.math.numbers.N5;
 import edu.wpi.first.networktables.DoubleArrayPublisher;
+import edu.wpi.first.networktables.DoubleArraySubscriber;
 import edu.wpi.first.networktables.NetworkTableInstance;
 import edu.wpi.first.networktables.PubSubOption;
 import edu.wpi.first.networktables.StructArrayPublisher;
@@ -39,7 +40,7 @@ public class GtsamInterface {
         Mat cameraMat;
         Mat distCoeffs;
 
-        public CameraCalibration(Matrix<N3, N3> camMat, Matrix<?, N1> distCoeffs) {
+        public CameraCalibration(Matrix<N3, N3> camMat, Matrix<N5, N1> distCoeffs) {
             OpenCVHelp.forceLoadOpenCV();
             
             this.cameraMat = OpenCVHelp.matrixToMat(camMat.getStorage());
@@ -91,6 +92,7 @@ public class GtsamInterface {
     StructPublisher<Pose3d> guessPub;
     Map<String, CameraInterface> cameras = new HashMap<>();
     StructSubscriber<Pose3d> optimizedPoseSub;
+    DoubleArraySubscriber stdDevSub;
 
     // Estimated odom-only location relative to robot boot. We assume zero slip here
     Pose3d localOdometryPose = new Pose3d();
@@ -107,7 +109,9 @@ public class GtsamInterface {
         optimizedPoseSub = NetworkTableInstance.getDefault()
                 .getStructTopic("/gtsam_meme/output/optimized_pose", Pose3d.struct)
                 .subscribe(null, PubSubOption.sendAll(true), PubSubOption.keepDuplicates(true));
-
+        stdDevSub = NetworkTableInstance.getDefault()
+                .getDoubleArrayTopic("/gtsam_meme/output/pose_stddev")
+                .subscribe(null, PubSubOption.sendAll(true), PubSubOption.keepDuplicates(true));
         cameraNames.stream().map(CameraInterface::new).forEach(it -> cameras.put(it.name, it));
     }
 
@@ -145,21 +149,21 @@ public class GtsamInterface {
      * Update the localizer with new info from this robot loop iteration.
      * 
      * @param odomTime The time that the odometry twist from last iteration
-     *                 was collected at, in microseconds. WPIUtilJNI::now is
-     *                 what I used
+     *                 was collected at, in seconds. 
      * @param odom     The twist encoding chassis movement from last
      *                 timestamp to now. I use
      *                 SwerveDriveKinematics::toTwist2d
      * @param guess    An (optional, possibly null) initial guess at robot
      *                 pose from solvePNP or prior knowledge.
      */
-    public void sendOdomUpdate(long odomTime, Twist3d odom,
+    public void sendOdomUpdate(double odomTimestamp, Twist3d odom,
             Pose3d guess) {
 
-        odomPub.set(odom, odomTime);
+        long odomTimeMicroSec = (long) (odomTimestamp * 1e6);
+        odomPub.set(odom, odomTimeMicroSec);
 
         if (guess != null) {
-            guessPub.set(guess, odomTime);
+            guessPub.set(guess, odomTimeMicroSec);
             if (!hasBeenSeededWithGuess) {
                 localOdometryPose = guess;
                 hasBeenSeededWithGuess = true;
@@ -167,34 +171,35 @@ public class GtsamInterface {
         }
 
         localOdometryPose = localOdometryPose.exp(odom);
-        odometryBuffer.addSample(odomTime / 1e6, localOdometryPose);
+        odometryBuffer.addSample(odomTimestamp, localOdometryPose);
     }
 
     /**
      * Update the localizer with new info from this robot loop iteration.
      * 
      * @param camName         The name of the camera
-     * @param tagDetTime      The time that the frame encoding detected tags
-     *                        collected at, in microseconds. WPIUtilJNI::now is what
-     *                        I used
+     * @param tagDetTimestamp      The time that the frame encoding detected tags
+     *                        collected at, in seconds.
      * @param camDetectedTags The list of tags this camera could see
      * @param robotTcam       Transform from robot to camera optical focal point.
      *                        This is not latency compensated yet, so maybe don't
      *                        put your camera on a turret
      */
-    public void sendVisionUpdate(String camName, long tagDetTime, List<TagDetection> camDetectedTags,
+    public void sendVisionUpdate(String camName, double tagDetTimestamp, List<TagDetection> camDetectedTags,
             Transform3d robotTcam) {
 
+        long tagDetTimeMicroSec = (long) (tagDetTimestamp * 1e6);
         var cam = cameras.get(camName);
         if (cam == null) {
             throw new RuntimeException("Camera " + camName + " not in map!");
         }
 
         cam.tagPub.set(camDetectedTags.stream().map(it -> cam.undistort(it)).collect(Collectors.toList())
-                .toArray(new TagDetection[0]), tagDetTime);
-        cam.robotTcamPub.set(robotTcam, tagDetTime);
+                .toArray(new TagDetection[0]), tagDetTimeMicroSec);
+        cam.robotTcamPub.set(robotTcam, tagDetTimeMicroSec);
     }
 
+    /** Keeping this in, in case people really hate the idea below */
     public Pose3d getLatencyCompensatedPoseEstimate() {
         var poseEst = optimizedPoseSub.getAtomic();
         if (poseEst.timestamp != 0) {
@@ -212,6 +217,26 @@ public class GtsamInterface {
         } else {
             System.err.println("No pose estimate yet");
             return new Pose3d();
+        }
+    }
+
+    public Optional<OptimizedPose> getOptimizedPose() {
+       var poseEst = optimizedPoseSub.getAtomic();
+        if (poseEst.timestamp != 0) {
+            var poseAtSample = odometryBuffer.getSample(poseEst.timestamp / 1e6);
+            var poseNow = localOdometryPose;
+
+            if (poseAtSample.isEmpty()) {
+                // huh
+                System.err.println("pose outside buffer?");
+                return Optional.empty();
+            }
+
+            var poseDelta = poseNow.minus(poseAtSample.get());
+            return Optional.of(new OptimizedPose(poseEst, poseDelta, stdDevSub.get()));
+        } else {
+            System.err.println("No pose estimate yet");
+            return Optional.empty();
         }
     }
 }
